@@ -1,0 +1,210 @@
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_BMP280.h>
+#include <Adafruit_SH110X.h>
+#include <RTClib.h>
+#include <WebServer.h>
+
+#ifndef WHITE
+#define WHITE 1
+#endif
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_ADDR 0x3C
+#define TCA_ADDR 0x70
+
+// Wi-Fi AP credentials
+const char* ssid = "Deke";
+const char* password = "12345678";
+
+// Fan pins
+#define FAN1_PIN 25  // inlet
+#define FAN2_PIN 26  // outlet
+
+// Thresholds
+#define TEMP_THRESHOLD 35.0
+#define HUM_THRESHOLD 60.0
+
+// PWM setup
+const int freq = 5000;
+const int fanChannel1 = 0;
+const int fanChannel2 = 1;
+const int resolution = 8; // 0–255 duty cycle
+
+Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_AHTX0 aht;
+Adafruit_BMP280 bmp;
+RTC_DS3231 rtc;
+WebServer server(80);
+
+struct SensorData {
+  float temp;
+  float hum;
+  float press;
+  String timeStr;
+};
+SensorData sensors[2];
+
+unsigned long fan1Start = 0, fan2Start = 0;
+bool fan1On = false, fan2On = false;
+
+void tcaSelect(uint8_t channel) {
+  if (channel > 7) return;
+  Wire.beginTransmission(TCA_ADDR);
+  Wire.write(1 << channel);
+  Wire.endTransmission();
+}
+
+void controlFans() {
+  for (int i = 0; i < 2; i++) {
+    // Fan 1 (temperature control)
+    if (sensors[i].temp > TEMP_THRESHOLD) {
+      if (!fan1On) {
+        fan1On = true;
+        fan1Start = millis();
+        Serial.printf("Sensor %d: Temperature above %.1f°C! Fan 1 ON\n", i + 1, TEMP_THRESHOLD);
+      }
+      int speed = map(sensors[i].temp, TEMP_THRESHOLD, TEMP_THRESHOLD + 10, 128, 255);
+      speed = constrain(speed, 128, 255);
+      ledcWrite(fanChannel1, speed);
+    } else if (fan1On) {
+      fan1On = false;
+      ledcWrite(fanChannel1, 0);
+      unsigned long duration = (millis() - fan1Start) / 1000;
+      Serial.printf("Sensor %d: Temperature normalized. Fan 1 OFF. Duration: %lus\n", i + 1, duration);
+    }
+
+    // Fan 2 (humidity control)
+    if (sensors[i].hum > HUM_THRESHOLD) {
+      if (!fan2On) {
+        fan2On = true;
+        fan2Start = millis();
+        Serial.printf("Sensor %d: Humidity above %.1f%%! Fan 2 ON\n", i + 1, HUM_THRESHOLD);
+      }
+      int speed = map(sensors[i].hum, HUM_THRESHOLD, HUM_THRESHOLD + 20, 128, 255);
+      speed = constrain(speed, 128, 255);
+      ledcWrite(fanChannel2, speed);
+    } else if (fan2On) {
+      fan2On = false;
+      ledcWrite(fanChannel2, 0);
+      unsigned long duration = (millis() - fan2Start) / 1000;
+      Serial.printf("Sensor %d: Humidity normalized. Fan 2 OFF. Duration: %lus\n", i + 1, duration);
+    }
+  }
+}
+
+void readSensors() {
+  for (uint8_t i = 0; i < 2; i++) {
+    tcaSelect(i);
+    sensors_event_t humEvent, tempEvent;
+    aht.getEvent(&humEvent, &tempEvent);
+    float pressure = bmp.readPressure() / 100.0F;
+    DateTime now = rtc.now();
+
+    sensors[i].temp = tempEvent.temperature;
+    sensors[i].hum = humEvent.relative_humidity;
+    sensors[i].press = pressure;
+    sensors[i].timeStr = String(now.hour()) + ":" + String(now.minute()) + ":" + String(now.second());
+
+    Serial.printf("Sensor %d | Temp: %.2f°C | Hum: %.2f%% | Press: %.2f hPa | Time: %s\n",
+                  i + 1, sensors[i].temp, sensors[i].hum, sensors[i].press, sensors[i].timeStr.c_str());
+  }
+}
+
+void handleRoot() {
+  readSensors();
+  controlFans();
+
+  String html = "<!DOCTYPE html><html><head><title>ESP32 Smart Env System</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:Arial;text-align:center;} .sensor{border:1px solid #333;padding:10px;margin:10px;display:inline-block;}</style>";
+  html += "</head><body><h2>Smart Environmental Dashboard</h2>";
+
+  for (int i = 0; i < 2; i++) {
+    html += "<div class='sensor'>";
+    html += "<h3>Sensor " + String(i + 1) + "</h3>";
+    html += "Temp: " + String(sensors[i].temp) + " °C<br>";
+    html += "Hum: " + String(sensors[i].hum) + " %<br>";
+    html += "Pressure: " + String(sensors[i].press) + " hPa<br>";
+    html += "Time: " + sensors[i].timeStr + "<br><hr>";
+
+    if (sensors[i].temp > TEMP_THRESHOLD)
+      html += "<b style='color:red;'>Temperature above threshold! Fan 1 ON</b><br>";
+    else
+      html += "<b style='color:green;'>Temperature normal</b><br>";
+
+    if (sensors[i].hum > HUM_THRESHOLD)
+      html += "<b style='color:blue;'>Humidity above threshold! Fan 2 ON</b><br>";
+    else
+      html += "<b style='color:green;'>Humidity normal</b><br>";
+
+    html += "</div>";
+  }
+
+  html += "<script>setTimeout(()=>{location.reload();},1500);</script>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+
+  if (!display.begin(OLED_ADDR, true)) {
+    Serial.println("OLED not found!");
+    while (1);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0, 0);
+  display.println("Initializing...");
+  display.display();
+
+  // RTC
+  if (!rtc.begin()) while (1);
+  if (rtc.lostPower()) rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+
+  // Fans (PWM)
+  ledcSetup(fanChannel1, freq, resolution);
+  ledcSetup(fanChannel2, freq, resolution);
+  ledcAttachPin(FAN1_PIN, fanChannel1);
+  ledcAttachPin(FAN2_PIN, fanChannel2);
+
+  // Sensors
+  for (uint8_t i = 0; i < 2; i++) {
+    tcaSelect(i);
+    if (!aht.begin()) Serial.printf("AHT20 %d not found!\n", i);
+    if (!bmp.begin(0x76)) Serial.printf("BMP280 %d not found!\n", i);
+  }
+
+  // Access Point
+  WiFi.softAP(ssid, password);
+  delay(100);
+  IPAddress IP = WiFi.softAPIP();
+  Serial.print("AP Started! Connect to SSID: ");
+  Serial.println(ssid);
+  Serial.print("AP IP address: ");
+  Serial.println(IP);
+
+  server.on("/", handleRoot);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+  readSensors();
+  controlFans();
+
+  // OLED display
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  for (int i = 0; i < 2; i++) {
+    display.printf("S%d T:%.1fC H:%.1f%%\n", i + 1, sensors[i].temp, sensors[i].hum);
+  }
+  display.display();
+  delay(1000);
+}

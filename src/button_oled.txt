@@ -1,0 +1,142 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Button pins (pull-down)
+#define BTN_NEXT 18
+#define BTN_SELECT 19
+
+// Menu items
+String pages[] = {
+  "Environment",
+  "Grains",
+  "Legumes",
+  "Fruits",
+  "Root Tubers",
+  "Stem Tubers"
+};
+int totalPages = sizeof(pages) / sizeof(pages[0]);
+int currentPage = 0;
+
+// Function prototypes
+void showMenu();
+void showSubMenu();
+void showEnvironmentData();
+
+// App states
+bool inSubMenu = false;
+
+// Debounce control
+unsigned long lastPress = 0;
+const int debounceDelay = 200;
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BTN_NEXT, INPUT);
+  pinMode(BTN_SELECT, INPUT);
+
+  if (!display.begin(0x3C, true)) {
+    Serial.println(F("SH1106 init failed"));
+    for (;;);
+  }
+
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Starting System...");
+  display.display();
+  delay(1000);
+
+  showMenu();
+}
+
+void loop() {
+  // Navigation button
+  if (digitalRead(BTN_NEXT) == HIGH && millis() - lastPress > debounceDelay) {
+    lastPress = millis();
+    if (!inSubMenu) {
+      // Cycle through menu items
+      currentPage++;
+      if (currentPage >= totalPages) currentPage = 0;
+      showMenu();
+    }
+  }
+
+  // Selection button
+  if (digitalRead(BTN_SELECT) == HIGH && millis() - lastPress > debounceDelay) {
+    lastPress = millis();
+    if (!inSubMenu) {
+      // Enter selected menu
+      inSubMenu = true;
+      showSubMenu();
+    } else {
+      // Exit submenu (go back)
+      inSubMenu = false;
+      showMenu();
+    }
+  }
+
+  // If inside environment page, keep updating
+  if (inSubMenu && currentPage == 0) {
+    showEnvironmentData();
+  }
+}
+
+void showMenu() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("== Main Menu ==");
+  display.drawLine(0, 10, 128, 10, SH110X_WHITE);
+  display.setTextSize(1.5);
+  display.setCursor(0, 25);
+  display.println(pages[currentPage]);
+  display.setTextSize(1);
+  display.setCursor(0, 55);
+  display.println("Next = Move | Select = Enter");
+  display.display();
+}
+
+void showEnvironmentData() {
+  // Example sensor simulation
+  float temp = 27.2;
+  float hum = 61.3;
+
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Environment");
+  display.drawLine(0, 10, 128, 10, SH110X_WHITE);
+  display.setCursor(0, 20);
+  display.print("Temp: "); display.print(temp); display.println(" C");
+  display.setCursor(0, 35);
+  display.print("Humidity: "); display.print(hum); display.println(" %");
+  display.setCursor(0, 55);
+  display.println("Select = Back");
+  display.display();
+}
+
+void showSubMenu() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("Category: ");
+  display.println(pages[currentPage]);
+  display.drawLine(0, 10, 128, 10, SH110X_WHITE);
+
+  if (currentPage == 0) {
+    showEnvironmentData();
+  } else {
+    display.setCursor(0, 25);
+    display.println("Info loading...");
+    display.setCursor(0, 45);
+    display.println("Press Select to go back");
+    display.display();
+  }
+}

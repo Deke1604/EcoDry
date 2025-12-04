@@ -1,0 +1,269 @@
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_BMP280.h>
+#include <Adafruit_SH110X.h>
+#include <RTClib.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+// ==================== DISPLAY SETTINGS ====================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_ADDR 0x3C
+Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ==================== BUTTONS ====================
+#define BTN_NEXT 32
+#define BTN_SELECT 33
+unsigned long lastPress = 0;
+const int debounceDelay = 200;
+bool inSubMenu = false;
+int currentPage = 0;
+String pages[] = {"Environment", "Grains", "Legumes", "Fruits", "Root Tubers", "Stem Tubers"};
+int totalPages = sizeof(pages) / sizeof(pages[0]);
+
+// ==================== FAN / LOCK / RFID ====================
+#define FAN1_PIN 25
+#define FAN2_PIN 26
+#define SOLENOID_PIN 27
+#define RST_PIN 4
+#define SS_PIN 5
+#define TEMP_THRESHOLD 35.0
+#define HUM_THRESHOLD 60.0
+
+const int freq = 5000;
+const int fanChannel1 = 0;
+const int fanChannel2 = 1;
+const int resolution = 8;
+
+bool fan1On = false, fan2On = false, lockOpen = false;
+unsigned long fan1Start = 0, fan2Start = 0, lockStart = 0;
+
+// ==================== MULTIPLEXER / SENSORS ====================
+#define TCA_ADDR 0x70
+Adafruit_AHTX0 aht;
+Adafruit_BMP280 bmp;
+RTC_DS3231 rtc;
+WebServer server(80);
+MFRC522 rfid(SS_PIN, RST_PIN);
+byte registeredUID[4] = {0x3B, 0x07, 0x92, 0x5F}; // {0x13, 0x07, 0x88, 0x1E}
+// ==================== DATA STRUCT ====================
+struct SensorData {
+  float temp;
+  float hum;
+  float press;
+  String timeStr;
+};
+SensorData sensors[2];
+
+// ==================== FUNCTIONS ====================
+void safePrint(const String &msg) { Serial.println(msg); }
+
+void tcaSelect(uint8_t channel) {
+  if (channel > 7) return;
+  Wire.beginTransmission(TCA_ADDR);
+  Wire.write(1 << channel);
+  Wire.endTransmission();
+}
+
+void readSensors() {
+  for (uint8_t i = 0; i < 2; i++) {
+    tcaSelect(i);
+    sensors_event_t humEvent, tempEvent;
+    aht.getEvent(&humEvent, &tempEvent);
+    float pressure = bmp.readPressure() / 100.0F;
+    DateTime now = rtc.now();
+    sensors[i].temp = tempEvent.temperature;
+    sensors[i].hum = humEvent.relative_humidity;
+    sensors[i].press = pressure;
+    sensors[i].timeStr = String(now.hour()) + ":" + String(now.minute()) + ":" + String(now.second());
+  }
+}
+
+void controlFans() {
+  for (int i = 0; i < 2; i++) {
+    if (sensors[i].temp > TEMP_THRESHOLD) {
+      if (!fan1On) { fan1On = true; fan1Start = millis(); safePrint("Fan 1 ON (Temp high)"); }
+      int speed = map(sensors[i].temp, TEMP_THRESHOLD, TEMP_THRESHOLD + 10, 128, 255);
+      speed = constrain(speed, 128, 255);
+      ledcWrite(fanChannel1, speed);
+    } else if (fan1On) {
+      fan1On = false; ledcWrite(fanChannel1, 0);
+      safePrint("Fan 1 OFF (Temp normal)");
+    }
+
+    if (sensors[i].hum > HUM_THRESHOLD) {
+      if (!fan2On) { fan2On = true; fan2Start = millis(); safePrint("Fan 2 ON (Humidity high)"); }
+      int speed = map(sensors[i].hum, HUM_THRESHOLD, HUM_THRESHOLD + 20, 128, 255);
+      speed = constrain(speed, 128, 255);
+      ledcWrite(fanChannel2, speed);
+    } else if (fan2On) {
+      fan2On = false; ledcWrite(fanChannel2, 0);
+      safePrint("Fan 2 OFF (Humidity normal)");
+    }
+  }
+}
+
+void checkRFID() {
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
+
+  Serial.print("Tag UID: ");
+  bool match = true;
+  for (byte i = 0; i < 4; i++) {
+    Serial.print(rfid.uid.uidByte[i], HEX);
+    if (rfid.uid.uidByte[i] != registeredUID[i]) match = false;
+  }
+  Serial.println();
+
+  if (match) {
+    digitalWrite(SOLENOID_PIN, HIGH);
+    lockOpen = true;
+    lockStart = millis();
+    Serial.println("Access Granted! Solenoid unlocked.");
+  } else {
+    Serial.println("Access Denied!");
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+void handleRoot() {
+  String html = "<html><head><title>Smart System</title><meta name='viewport' content='width=device-width'>";
+  html += "<style>body{text-align:center;font-family:Arial;} .sensor{border:1px solid #333;padding:10px;margin:10px;}</style></head><body>";
+  html += "<h2>ESP32 Smart Dashboard</h2>";
+  html += "<b>Fan1:</b> " + String(fan1On ? "ON" : "OFF") + "<br>";
+  html += "<b>Fan2:</b> " + String(fan2On ? "ON" : "OFF") + "<br>";
+  html += "<b>Lock:</b> " + String(lockOpen ? "OPEN" : "LOCKED") + "<hr>";
+
+  for (int i = 0; i < 2; i++) {
+    html += "<div class='sensor'><h3>Sensor " + String(i + 1) + "</h3>";
+    html += "Temp: " + String(sensors[i].temp) + " °C<br>";
+    html += "Hum: " + String(sensors[i].hum) + " %<br>";
+    html += "Press: " + String(sensors[i].press) + " hPa<br>";
+    html += "Time: " + sensors[i].timeStr + "</div>";
+  }
+  html += "<script>setTimeout(()=>location.reload(),1500)</script></body></html>";
+  server.send(200, "text/html", html);
+}
+
+// ==================== OLED UI ====================
+void showMenu() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("== Main Menu ==");
+  display.drawLine(0, 10, 128, 10, SH110X_WHITE);
+  display.setTextSize(2);
+  display.setCursor(0, 25);
+  display.println(pages[currentPage]);
+  display.setTextSize(1);
+  display.setCursor(0, 55);
+  display.println("Next=Move  Select=Enter");
+  display.display();
+}
+
+void showEnvironmentPage() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Environment");
+  display.drawLine(0, 10, 128, 10, SH110X_WHITE);
+  display.setCursor(0, 20);
+  display.printf("T: %.1fC H: %.1f%%", sensors[0].temp, sensors[0].hum);
+  display.setCursor(0, 35);
+  display.printf("P: %.1fhPa", sensors[0].press);
+  display.setCursor(0, 50);
+  display.printf("F1:%s F2:%s", fan1On ? "ON" : "OFF", fan2On ? "ON" : "OFF");
+  display.display();
+}
+
+void showSubMenu() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("Category: ");
+  display.println(pages[currentPage]);
+  display.drawLine(0, 10, 128, 10, SH110X_WHITE);
+
+  if (currentPage == 0) {
+    showEnvironmentPage();
+  } else {
+    display.setCursor(0, 25);
+    display.println("Info loading...");
+    display.setCursor(0, 45);
+    display.println("Press Select to go back");
+    display.display();
+  }
+}
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  safePrint("Booting...");
+  Wire.begin(21, 22);
+  SPI.begin(18, 19, 23, 5);
+
+  pinMode(BTN_NEXT, INPUT);
+  pinMode(BTN_SELECT, INPUT);
+  pinMode(SOLENOID_PIN, OUTPUT);
+  digitalWrite(SOLENOID_PIN, LOW);
+
+  display.begin(OLED_ADDR, true);
+  rtc.begin(); aht.begin(); bmp.begin(0x76); rfid.PCD_Init();
+
+  ledcSetup(fanChannel1, freq, resolution);
+  ledcSetup(fanChannel2, freq, resolution);
+  ledcAttachPin(FAN1_PIN, fanChannel1);
+  ledcAttachPin(FAN2_PIN, fanChannel2);
+
+  WiFi.softAP("Deke", "12345678");
+  server.on("/", handleRoot);
+  server.begin();
+
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setCursor(0, 0);
+  display.println("System Ready");
+  display.display();
+  delay(1000);
+  showMenu();
+}
+
+// ==================== LOOP ====================
+void loop() {
+  server.handleClient();
+  readSensors();
+  controlFans();
+  checkRFID();
+
+  // --- Button Navigation ---
+  if (digitalRead(BTN_NEXT) == HIGH && millis() - lastPress > debounceDelay) {
+    lastPress = millis();
+    if (!inSubMenu) {
+      currentPage++;
+      if (currentPage >= totalPages) currentPage = 0;
+      showMenu();
+    }
+  }
+
+  if (digitalRead(BTN_SELECT) == HIGH && millis() - lastPress > debounceDelay) {
+    lastPress = millis();
+    inSubMenu = !inSubMenu;
+    if (inSubMenu) showSubMenu();
+    else showMenu();
+  }
+
+  if (inSubMenu && currentPage == 0) showEnvironmentPage();
+
+  if (lockOpen && millis() - lockStart > 5000) {
+    digitalWrite(SOLENOID_PIN, LOW);
+    lockOpen = false;
+    Serial.println("Solenoid locked again.");
+  }
+
+  delay(500);
+}

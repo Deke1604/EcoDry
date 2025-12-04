@@ -1,0 +1,507 @@
+/* FULL INTEGRATED SKETCH
+   - ESP32 + SH110X OLED (I2C)
+   - AHT20 (temp/hum) & BMP280 (pressure) on TCA multiplexer (2 sensors)
+   - RTC DS3231
+   - MFRC522 (SPI) RFID
+   - Fans controlled via LEDC PWM
+   - Solenoid lock + mechanical override (both buttons held 3s)
+   - Two buttons: NEXT (navigate) + SELECT (enter/select)
+   - Crop drying automation + OLED progress + buzzer + web dashboard alert
+*/
+
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_BMP280.h>
+#include <Adafruit_SH110X.h>
+#include <RTClib.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+// ==================== DISPLAY SETTINGS ====================
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_ADDR 0x3C
+Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// ==================== BUTTONS / BUZZER / HEATER ====================
+#define BTN_NEXT 32
+#define BTN_SELECT 33
+#define BUZZER_PIN 13
+#define HEATER_PIN 14
+
+unsigned long lastPress = 0;
+const int debounceDelay = 200;
+bool inSubMenu = false;
+int currentPage = 0;
+String pages[] = {"Environment", "Grains", "Legumes", "Fruits", "Root Tubers", "Stem Tubers"};
+int totalPages = sizeof(pages) / sizeof(pages[0]);
+
+// Mechanical override detection
+unsigned long overrideStart = 0;
+const unsigned long OVERRIDE_HOLD_MS = 3000;
+
+// ==================== FAN / LOCK / RFID ====================
+#define FAN1_PIN 25
+#define FAN2_PIN 26
+#define SOLENOID_PIN 27
+#define RST_PIN 4
+#define SS_PIN 5
+
+// Baseline thresholds for normal/autonomous control
+#define TEMP_THRESHOLD 35.0
+#define HUM_THRESHOLD 60.0
+
+const int freq = 5000;
+const int fanChannel1 = 0;
+const int fanChannel2 = 1;
+const int resolution = 8;
+
+bool fan1On = false, fan2On = false, lockOpen = false;
+unsigned long fan1Start = 0, fan2Start = 0, lockStart = 0;
+
+// ==================== MULTIPLEXER / SENSORS / PERIPHERALS ====================
+#define TCA_ADDR 0x70
+Adafruit_AHTX0 aht;
+Adafruit_BMP280 bmp;
+RTC_DS3231 rtc;
+WebServer server(80);
+MFRC522 rfid(SS_PIN, RST_PIN);
+byte registeredUID[4] = {0x3B, 0x07, 0x92, 0x5F}; // replace with your tag
+
+// ==================== DATA STRUCT ====================
+struct SensorData {
+  float temp;
+  float hum;
+  float press;
+  String timeStr;
+};
+SensorData sensors[2]; // sensors[0] and sensors[1] via TCA
+
+// ==================== DRYING / CROPS ====================
+bool dryingMode = false;
+unsigned long dryingStart = 0;
+unsigned long dryingDuration = 0; // ms
+float targetTemp = 0, targetHum = 0;
+bool dryingCompleted = false;
+String alertMessage = "";
+
+struct CropProfile {
+  String name;
+  float temp;
+  float hum;
+  unsigned long time; // milliseconds
+};
+CropProfile crops[] = {
+  {"Grains", 40.0, 55.0, 30UL * 60UL * 1000UL},       // example: 30 minutes
+  {"Legumes", 45.0, 50.0, 40UL * 60UL * 1000UL},      // 40 minutes
+  {"Fruits", 35.0, 60.0, 25UL * 60UL * 1000UL},       // 25 minutes
+  {"Root Tubers", 50.0, 45.0, 50UL * 60UL * 1000UL},  // 50 minutes
+  {"Stem Tubers", 48.0, 50.0, 50UL * 60UL * 1000UL}
+};
+int cropCount = sizeof(crops) / sizeof(crops[0]);
+
+// ==================== UTIL ====================
+void safePrint(const String &msg) { Serial.println(msg); }
+
+// TCA multiplexer select
+void tcaSelect(uint8_t channel) {
+  if (channel > 7) return;
+  Wire.beginTransmission(TCA_ADDR);
+  Wire.write(1 << channel);
+  Wire.endTransmission();
+}
+
+// Read sensors through TCA (two sensor channels)
+void readSensors() {
+  for (uint8_t i = 0; i < 2; i++) {
+    tcaSelect(i);
+    sensors_event_t humEvent, tempEvent;
+    aht.getEvent(&humEvent, &tempEvent); // AHT sensor
+    float pressure = bmp.readPressure() / 100.0F; // hPa
+    DateTime now = rtc.now();
+    sensors[i].temp = tempEvent.temperature;
+    sensors[i].hum = humEvent.relative_humidity;
+    sensors[i].press = pressure;
+    sensors[i].timeStr = String(now.hour()) + ":" + String(now.minute()) + ":" + String(now.second());
+  }
+}
+
+// ==================== FAN CONTROL ====================
+// Normal mode: sensor[0] -> fan1 (temp), sensor[1] -> fan2 (humidity)
+// During dryingMode: handleDrying() will override fans/heater to meet targets.
+void controlFansNormal() {
+  // Fan1 controlled by sensor 0 temperature threshold
+  if (sensors[0].temp > TEMP_THRESHOLD) {
+    if (!fan1On) { fan1On = true; fan1Start = millis(); }
+    ledcWrite(fanChannel1, 255);
+  } else {
+    if (fan1On) fan1On = false;
+    ledcWrite(fanChannel1, 0);
+  }
+
+  // Fan2 controlled by sensor 1 humidity threshold
+  if (sensors[1].hum > HUM_THRESHOLD) {
+    if (!fan2On) { fan2On = true; fan2Start = millis(); }
+    ledcWrite(fanChannel2, 255);
+  } else {
+    if (fan2On) fan2On = false;
+    ledcWrite(fanChannel2, 0);
+  }
+}
+
+// ==================== DRYING MODE CONTROL ====================
+/* Assumptions: 
+   - We interpret the user's "Fan1 brings external hot air in when the temperature is hot"
+     as: during drying, we run heater if chamber temp < target, and run fan1 to bring in heated air,
+     with fan speed proportional to (targetTemp - currentTemp). 
+   - Fan2 exhausts humid air when humidity is above target, with speed proportional to (currentHum - targetHum).
+*/
+void handleDrying() {
+  if (!dryingMode) return;
+
+  unsigned long elapsed = millis() - dryingStart;
+  if (elapsed < dryingDuration) {
+    // Temperature regulation (sensor[0])
+    if (sensors[0].temp < targetTemp - 0.5) {
+      // Need more heat: switch heater on and set fan1 to bring in air
+      digitalWrite(HEATER_PIN, HIGH);
+      // set fan1 speed proportional to temperature deficit
+      float deficit = targetTemp - sensors[0].temp; // e.g., 0..10
+      int speed = (int) map((int)constrain(deficit*10, 0, 100), 0, 100, 128, 255); // crude mapping
+      speed = constrain(speed, 128, 255);
+      ledcWrite(fanChannel1, speed);
+      fan1On = true;
+    } else {
+      // target reached: turn off heater, reduce fan1
+      digitalWrite(HEATER_PIN, LOW);
+      ledcWrite(fanChannel1, 0);
+      fan1On = false;
+    }
+
+    // Humidity regulation (sensor[1])
+    if (sensors[1].hum > targetHum + 1.0) {
+      float excess = sensors[1].hum - targetHum;
+      int speed = (int) map((int)constrain(excess*10, 0, 100), 0, 100, 128, 255);
+      speed = constrain(speed, 128, 255);
+      ledcWrite(fanChannel2, speed);
+      fan2On = true;
+    } else {
+      ledcWrite(fanChannel2, 0);
+      fan2On = false;
+    }
+
+    // Optionally, show progress on OLED (handled in loop via showEnvironmentPage when drying)
+  } else {
+    // Drying complete: shut everything down and notify
+    dryingMode = false;
+    dryingCompleted = true;
+    digitalWrite(HEATER_PIN, LOW);
+    ledcWrite(fanChannel1, 0);
+    ledcWrite(fanChannel2, 0);
+    fan1On = fan2On = false;
+    alertMessage = "Drying complete: " + String(targetTemp, 1) + "C / " + String(targetHum, 1) + "%";
+    safePrint(alertMessage);
+    // Buzzer notification (short beep pattern)
+    for (int i = 0; i < 3; i++) {
+      digitalWrite(BUZZER_PIN, HIGH); delay(200);
+      digitalWrite(BUZZER_PIN, LOW); delay(150);
+    }
+  }
+}
+
+// ==================== RFID ====================
+void checkRFID() {
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
+
+  Serial.print("Tag UID: ");
+  bool match = true;
+  for (byte i = 0; i < 4; i++) {
+    Serial.print(rfid.uid.uidByte[i], HEX);
+    if (rfid.uid.uidByte[i] != registeredUID[i]) match = false;
+  }
+  Serial.println();
+
+  if (match) {
+    digitalWrite(SOLENOID_PIN, HIGH);
+    lockOpen = true;
+    lockStart = millis();
+    Serial.println("Access Granted! Solenoid unlocked.");
+  } else {
+    Serial.println("Access Denied!");
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+// ==================== WEB UI ====================
+void handleRoot() {
+  String html = "<html><head><title>ESP32 Smart System</title><meta name='viewport' content='width=device-width'>";
+  html += "<style>body{text-align:center;font-family:Arial;} .sensor{border:1px solid #333;padding:10px;margin:10px;display:inline-block;}</style></head><body>";
+  html += "<h2>ESP32 Smart Dashboard</h2>";
+  html += "<b>Fan1:</b> " + String(fan1On ? "ON" : "OFF") + "<br>";
+  html += "<b>Fan2:</b> " + String(fan2On ? "ON" : "OFF") + "<br>";
+  html += "<b>Lock:</b> " + String(lockOpen ? "OPEN" : "LOCKED") + "<br>";
+  html += "<b>Drying Mode:</b> " + String(dryingMode ? "RUNNING" : dryingCompleted ? "COMPLETE" : "IDLE") + "<br>";
+  if (dryingMode) {
+    unsigned long elapsed = millis() - dryingStart;
+    unsigned long remain = dryingDuration > elapsed ? (dryingDuration - elapsed) : 0;
+    html += "<b>Time left:</b> " + String(remain/1000) + "s<br>";
+  }
+  if (alertMessage.length()) html += "<hr><b>Alert:</b> " + alertMessage + "<br>";
+
+  for (int i = 0; i < 2; i++) {
+    html += "<div class='sensor'><h3>Sensor " + String(i + 1) + "</h3>";
+    html += "Temp: " + String(sensors[i].temp) + " °C<br>";
+    html += "Hum: " + String(sensors[i].hum) + " %<br>";
+    html += "Press: " + String(sensors[i].press) + " hPa<br>";
+    html += "Time: " + sensors[i].timeStr + "</div>";
+  }
+  html += "<script>setTimeout(()=>location.reload(),1500)</script></body></html>";
+  server.send(200, "text/html", html);
+}
+
+// ==================== OLED UI ====================
+void showMenu() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("== Main Menu ==");
+  display.drawLine(0, 10, 128, 10, SH110X_WHITE);
+  display.setTextSize(2);
+  display.setCursor(0, 25);
+  display.println(pages[currentPage]);
+  display.setTextSize(1);
+  display.setCursor(0, 55);
+  display.println("Next=Move  Select=Enter");
+  display.display();
+}
+
+// Environment or Drying status page shows sensor 0 (temp), sensor1 (hum), fans, heater, and if drying -> progress/time left
+void showEnvironmentPage() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Environment");
+  display.drawLine(0, 10, 128, 10, SH110X_WHITE);
+
+  display.setCursor(0, 12);
+  display.printf("T0: %.1fC  H1: %.1f%%", sensors[0].temp, sensors[1].hum);
+  display.setCursor(0, 28);
+  display.printf("P0: %.1fhPa", sensors[0].press);
+  display.setCursor(0, 40);
+  display.printf("F1:%s F2:%s", fan1On ? "ON" : "OFF", fan2On ? "ON" : "OFF");
+  display.setCursor(0, 50);
+  display.printf("Hea:%s", digitalRead(HEATER_PIN) ? "ON" : "OFF");
+  // If drying, show progress bar + time left
+  if (dryingMode) {
+    unsigned long elapsed = millis() - dryingStart;
+    float pct = (float)elapsed / (float)dryingDuration;
+    if (pct > 1.0) pct = 1.0;
+    int barW = 100;
+    int filled = (int)(pct * barW);
+    display.drawRect(14, 56, barW, 6, SH110X_WHITE);
+    for (int x = 0; x < filled; x += 2) display.drawFastVLine(14 + x, 56, 6, SH110X_WHITE);
+    unsigned long remain = dryingDuration > elapsed ? (dryingDuration - elapsed) : 0;
+    display.setCursor(0, 58);
+    display.setTextSize(1);
+    display.printf(" %lus", remain/1000);
+  }
+  display.display();
+}
+
+void showSubMenu() {
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.print("Category: ");
+  display.println(pages[currentPage]);
+  display.drawLine(0, 10, 128, 10, SH110X_WHITE);
+
+  if (currentPage == 0) {
+    showEnvironmentPage();
+  } else {
+    // Show crop profile summary & instruction to start drying by pressing select again
+    int idx = currentPage - 1; // pages[1] -> crops[0]
+    if (idx >= 0 && idx < cropCount) {
+      display.setCursor(0, 22);
+      display.setTextSize(1);
+      display.println(crops[idx].name);
+      display.setCursor(0, 34);
+      display.printf("T: %.0fC H: %.0f%%", crops[idx].temp, crops[idx].hum);
+      display.setCursor(0, 46);
+      unsigned long mins = crops[idx].time / 60000UL;
+      display.printf("Time: %lumin", mins);
+      display.setCursor(0, 56);
+      display.println("Press Select to start");
+    } else {
+      display.setCursor(0, 25);
+      display.println("Info loading...");
+    }
+    display.display();
+  }
+}
+
+// ==================== SETUP ====================
+void setup() {
+  Serial.begin(115200);
+  safePrint("Booting...");
+  Wire.begin(21, 22); // I2C SDA=21 SCL=22
+  SPI.begin(18, 19, 23, 5); // SCK, MISO, MOSI, SS
+
+  // pins
+  pinMode(BTN_NEXT, INPUT);      // external pull-down -> HIGH when pressed
+  pinMode(BTN_SELECT, INPUT);
+  pinMode(SOLENOID_PIN, OUTPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  pinMode(HEATER_PIN, OUTPUT);
+  digitalWrite(SOLENOID_PIN, LOW);
+  digitalWrite(BUZZER_PIN, LOW);
+  digitalWrite(HEATER_PIN, LOW);
+
+  // display
+  if (!display.begin(OLED_ADDR, true)) safePrint("OLED not found!");
+  display.clearDisplay();
+  display.setTextColor(SH110X_WHITE);
+  display.setCursor(0, 0);
+  display.println("Display init...");
+  display.display();
+
+  // sensors & RTC & RFID
+  if (!rtc.begin()) safePrint("RTC not found!");
+  if (!aht.begin()) safePrint("AHT not found!");
+  if (!bmp.begin(0x76)) safePrint("BMP280 not found!");
+  rfid.PCD_Init();
+  safePrint("RFID initialized");
+
+  // PWM fans
+  ledcSetup(fanChannel1, freq, resolution);
+  ledcSetup(fanChannel2, freq, resolution);
+  ledcAttachPin(FAN1_PIN, fanChannel1);
+  ledcAttachPin(FAN2_PIN, fanChannel2);
+
+  // WiFi AP + server
+  WiFi.softAP("Deke", "12345678");
+  server.on("/", handleRoot);
+  server.begin();
+  safePrint("Web server started");
+
+  // initial read to populate sensors[] (optional)
+  readSensors();
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("System Ready");
+  display.display();
+  delay(800);
+  showMenu();
+}
+
+// ==================== LOOP ====================
+void loop() {
+  server.handleClient();
+  readSensors();
+
+  // Always check RFID
+  checkRFID();
+
+  // Mechanical override (both buttons held for 3 seconds) - higher priority than normal single presses
+  bool nextPressed = digitalRead(BTN_NEXT) == HIGH;
+  bool selectPressed = digitalRead(BTN_SELECT) == HIGH;
+  if (nextPressed && selectPressed) {
+    if (overrideStart == 0) overrideStart = millis();
+    else if (millis() - overrideStart >= OVERRIDE_HOLD_MS && !lockOpen) {
+      // open lock via mechanical override
+      digitalWrite(SOLENOID_PIN, HIGH);
+      lockOpen = true;
+      lockStart = millis();
+      Serial.println("Mechanical override: Lock opened!");
+      // short buzz to confirm
+      digitalWrite(BUZZER_PIN, HIGH); delay(200);
+      digitalWrite(BUZZER_PIN, LOW);
+      overrideStart = 0; // reset to avoid repeated opens
+    }
+  } else {
+    overrideStart = 0;
+    // normal single-button navigation (debounced)
+    if (nextPressed && millis() - lastPress > debounceDelay) {
+      lastPress = millis();
+      if (!inSubMenu) {
+        currentPage++;
+        if (currentPage >= totalPages) currentPage = 0;
+        showMenu();
+      } else {
+        // In submenu, NEXT could be repurposed (e.g., cycle options), but we just ignore or could extend.
+      }
+    }
+
+    if (selectPressed && millis() - lastPress > debounceDelay) {
+      lastPress = millis();
+      // If not in submenu: enter submenu
+      if (!inSubMenu) {
+        inSubMenu = true;
+        showSubMenu();
+      } else {
+        // If in submenu and on a crop page -> start drying
+        if (currentPage == 0) {
+          // if environment page, SELECT toggles back to menu
+          inSubMenu = false;
+          showMenu();
+        } else {
+          int idx = currentPage - 1;
+          if (idx >= 0 && idx < cropCount) {
+            // start drying with crop profile
+            targetTemp = crops[idx].temp;
+            targetHum = crops[idx].hum;
+            dryingDuration = crops[idx].time;
+            dryingMode = true;
+            dryingCompleted = false;
+            dryingStart = millis();
+            alertMessage = "";
+            safePrint("Started drying: " + crops[idx].name);
+            // Immediately show submenu/drying page
+            showSubMenu();
+          } else {
+            // fallback: just exit submenu
+            inSubMenu = false;
+            showMenu();
+          }
+        }
+      }
+    }
+  }
+
+  // If not in drying mode, normal fan control
+  if (!dryingMode) controlFansNormal();
+
+  // If drying mode is active, handle control loop (overrides normal fans/heater)
+  handleDrying();
+
+  // Show dynamic info on display depending on state
+  if (inSubMenu) {
+    if (currentPage == 0) showEnvironmentPage();
+    else showSubMenu();
+  } else {
+    // If not in submenu, periodically update main menu or show a small status
+    // We'll refresh menu display occasionally to show live numbers if desired
+    showMenu();
+  }
+
+  // auto-lock solenoid after 5s (if opened by RFID or override)
+  if (lockOpen && millis() - lockStart > 5000) {
+    digitalWrite(SOLENOID_PIN, LOW);
+    lockOpen = false;
+    Serial.println("Solenoid locked again.");
+  }
+
+  // if drying completed, provide web-visible alert and keep buzzer handled earlier
+  if (dryingCompleted) {
+    // create a one-time web-visible alert (alertMessage already set)
+    dryingCompleted = false; // prevent repeated re-alerting; alertMessage remains for web UI
+  }
+
+  delay(500);
+}

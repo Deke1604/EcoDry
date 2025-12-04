@@ -1,0 +1,236 @@
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_BMP280.h>
+#include <Adafruit_SH110X.h>
+#include <RTClib.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <MFRC522.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_ADDR 0x3C
+#define TCA_ADDR 0x70
+
+// Wi-Fi AP credentials
+const char* ssid = "Deke";
+const char* password = "12345678";
+
+// Fan pins
+#define FAN1_PIN 25  // inlet
+#define FAN2_PIN 26  // outlet
+#define SOLENOID_PIN 27 // lock
+
+// RFID pins
+#define RST_PIN 4
+#define SS_PIN 5
+
+// Thresholds
+#define TEMP_THRESHOLD 35.0
+#define HUM_THRESHOLD 60.0
+
+// PWM setup
+const int freq = 5000;
+const int fanChannel1 = 0;
+const int fanChannel2 = 1;
+const int resolution = 8;
+
+Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_AHTX0 aht;
+Adafruit_BMP280 bmp;
+RTC_DS3231 rtc;
+WebServer server(80);
+MFRC522 rfid(SS_PIN, RST_PIN);
+
+// Registered RFID UID
+byte registeredUID[4] = {0x3B, 0x07, 0x92, 0x5F}; // Replace with your tag’s UID
+
+struct SensorData {
+  float temp;
+  float hum;
+  float press;
+  String timeStr;
+};
+SensorData sensors[2];
+
+bool fan1On = false, fan2On = false, lockOpen = false;
+unsigned long fan1Start = 0, fan2Start = 0, lockStart = 0;
+
+void safePrint(const String &msg) {
+  Serial.println(msg);
+}
+
+void tcaSelect(uint8_t channel) {
+  if (channel > 7) return;
+  Wire.beginTransmission(TCA_ADDR);
+  Wire.write(1 << channel);
+  Wire.endTransmission();
+}
+
+void readSensors() {
+  for (uint8_t i = 0; i < 2; i++) {
+    tcaSelect(i);
+    sensors_event_t humEvent, tempEvent;
+    aht.getEvent(&humEvent, &tempEvent);
+    float pressure = bmp.readPressure() / 100.0F;
+    DateTime now = rtc.now();
+    sensors[i].temp = tempEvent.temperature;
+    sensors[i].hum = humEvent.relative_humidity;
+    sensors[i].press = pressure;
+    sensors[i].timeStr = String(now.hour()) + ":" + String(now.minute()) + ":" + String(now.second());
+  }
+}
+
+void controlFans() {
+  for (int i = 0; i < 2; i++) {
+    // Temperature control
+    if (sensors[i].temp > TEMP_THRESHOLD) {
+      if (!fan1On) {
+        fan1On = true;
+        fan1Start = millis();
+        safePrint("Fan 1 ON (Temp high)");
+      }
+      int speed = map(sensors[i].temp, TEMP_THRESHOLD, TEMP_THRESHOLD + 10, 128, 255);
+      speed = constrain(speed, 128, 255);
+      ledcWrite(fanChannel1, speed);
+    } else if (fan1On) {
+      fan1On = false;
+      ledcWrite(fanChannel1, 0);
+      unsigned long duration = (millis() - fan1Start) / 1000;
+      safePrint("Fan 1 OFF (Temp normal). Ran for " + String(duration) + "s");
+    }
+
+    // Humidity control
+    if (sensors[i].hum > HUM_THRESHOLD) {
+      if (!fan2On) {
+        fan2On = true;
+        fan2Start = millis();
+        safePrint("Fan 2 ON (Humidity high)");
+      }
+      int speed = map(sensors[i].hum, HUM_THRESHOLD, HUM_THRESHOLD + 20, 128, 255);
+      speed = constrain(speed, 128, 255);
+      ledcWrite(fanChannel2, speed);
+    } else if (fan2On) {
+      fan2On = false;
+      ledcWrite(fanChannel2, 0);
+      unsigned long duration = (millis() - fan2Start) / 1000;
+      safePrint("Fan 2 OFF (Humidity normal). Ran for " + String(duration) + "s");
+    }
+  }
+}
+
+void checkRFID() {
+  if (!rfid.PICC_IsNewCardPresent() || !rfid.PICC_ReadCardSerial()) return;
+
+  Serial.print("Tag UID: ");
+  bool match = true;
+  for (byte i = 0; i < 4; i++) {
+    Serial.print(rfid.uid.uidByte[i], HEX);
+    if (rfid.uid.uidByte[i] != registeredUID[i]) match = false;
+  }
+  Serial.println();
+
+  if (match) {
+    digitalWrite(SOLENOID_PIN, HIGH);
+    lockOpen = true;
+    lockStart = millis();
+    Serial.println("Access Granted! Solenoid unlocked.");
+  } else {
+    Serial.println("Access Denied!");
+  }
+
+  rfid.PICC_HaltA();
+  rfid.PCD_StopCrypto1();
+}
+
+void updateOLED() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextSize(1);
+  display.printf("T: %.1fC  H: %.1f%%\n", sensors[0].temp, sensors[0].hum);
+  display.printf("Fan1:%s Fan2:%s\n", fan1On ? "ON" : "OFF", fan2On ? "ON" : "OFF");
+  display.printf("Lock: %s\n", lockOpen ? "OPEN" : "LOCKED");
+  display.display();
+}
+
+void handleRoot() {
+  String html = "<!DOCTYPE html><html><head><title>ESP32 Smart System</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:Arial;text-align:center;} .sensor{border:1px solid #333;padding:10px;margin:10px;display:inline-block;}</style>";
+  html += "</head><body><h2>Smart Dashboard</h2>";
+
+  html += "<p><b>Fan 1:</b> " + String(fan1On ? "ON" : "OFF") + "<br>";
+  html += "<b>Fan 2:</b> " + String(fan2On ? "ON" : "OFF") + "<br>";
+  html += "<b>Solenoid Lock:</b> " + String(lockOpen ? "OPEN" : "LOCKED") + "<br><hr>";
+
+  for (int i = 0; i < 2; i++) {
+    html += "<div class='sensor'>";
+    html += "<h3>Sensor " + String(i + 1) + "</h3>";
+    html += "Temp: " + String(sensors[i].temp) + " °C<br>";
+    html += "Hum: " + String(sensors[i].hum) + " %<br>";
+    html += "Press: " + String(sensors[i].press) + " hPa<br>";
+    html += "Time: " + sensors[i].timeStr + "<br>";
+    html += "</div>";
+  }
+
+  html += "<script>setTimeout(()=>{location.reload();},1500);</script>";
+  html += "</body></html>";
+
+  server.send(200, "text/html", html);
+}
+
+void setup() {
+  Serial.begin(115200);
+  safePrint("Booting system...");
+  Wire.begin(21, 22);
+  SPI.begin(18, 19, 23, 5);
+
+  pinMode(SOLENOID_PIN, OUTPUT);
+  digitalWrite(SOLENOID_PIN, LOW);
+
+  if (!display.begin(OLED_ADDR, true)) safePrint("OLED not found!");
+  if (!rtc.begin()) safePrint("RTC not found!");
+  if (!aht.begin()) safePrint("AHT20 not found!");
+  if (!bmp.begin(0x76)) safePrint("BMP280 not found!");
+
+  rfid.PCD_Init();
+  safePrint("RFID initialized");
+
+  ledcSetup(fanChannel1, freq, resolution);
+  ledcSetup(fanChannel2, freq, resolution);
+  ledcAttachPin(FAN1_PIN, fanChannel1);
+  ledcAttachPin(FAN2_PIN, fanChannel2);
+
+  WiFi.softAP(ssid, password);
+  delay(500);
+  safePrint("Wi-Fi AP started: " + String(ssid));
+  safePrint("AP IP: " + WiFi.softAPIP().toString());
+
+  server.on("/", handleRoot);
+  server.begin();
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.setTextColor(SH110X_WHITE);
+  display.println("System Ready");
+  display.display();
+}
+
+void loop() {
+  server.handleClient();
+  checkRFID();
+  readSensors();
+  controlFans();
+  updateOLED();
+
+  // auto-lock solenoid after 5s
+  if (lockOpen && millis() - lockStart > 5000) {
+    digitalWrite(SOLENOID_PIN, LOW);
+    lockOpen = false;
+    Serial.println("Solenoid locked again.");
+  }
+
+  delay(1000);
+}

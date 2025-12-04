@@ -1,0 +1,134 @@
+#include <WiFi.h>
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_BMP280.h>
+#include <Adafruit_SH110X.h>
+#include <RTClib.h>
+#include <WebServer.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define OLED_ADDR 0x3C
+#define TCA_ADDR 0x70
+#define WHITE 1
+
+const char* ssid = "Barnabas";
+const char* password = "123456789";
+
+Adafruit_SH1106G display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+Adafruit_AHTX0 aht;
+Adafruit_BMP280 bmp;
+RTC_DS3231 rtc;
+WebServer server(80);
+
+struct SensorData {
+  float temp;
+  float hum;
+  float press;
+  String timeStr;
+};
+
+SensorData sensors[2];
+
+void tcaSelect(uint8_t channel) {
+  if(channel>7) return;
+  Wire.beginTransmission(TCA_ADDR);
+  Wire.write(1 << channel);
+  Wire.endTransmission();
+}
+
+void readSensors() {
+  for(uint8_t i=0;i<2;i++){
+    tcaSelect(i);
+    sensors_event_t humEvent, tempEvent;
+    aht.getEvent(&humEvent, &tempEvent);
+    float pressure = bmp.readPressure()/100.0F;
+    DateTime now = rtc.now();
+    sensors[i].temp = tempEvent.temperature;
+    sensors[i].hum = humEvent.relative_humidity;
+    sensors[i].press = pressure;
+    sensors[i].timeStr = String(now.hour()) + ":" + String(now.minute()) + ":" + String(now.second());
+
+    // Serial monitor output
+    Serial.printf("Sensor %d | Temp: %.2f C | Hum: %.2f %% | Press: %.2f hPa | Time: %s\n",
+                  i+1, sensors[i].temp, sensors[i].hum, sensors[i].press, sensors[i].timeStr.c_str());
+  }
+}
+
+void handleRoot() {
+  readSensors(); // get latest data
+  String html = "<!DOCTYPE html><html><head><title>ESP32 Sensors</title>";
+  html += "<meta name='viewport' content='width=device-width, initial-scale=1'>";
+  html += "<style>body{font-family:Arial;text-align:center;} .sensor{border:1px solid #333;padding:10px;margin:10px;display:inline-block;}</style>";
+  html += "</head><body><h2>ESP32 Sensor Dashboard</h2>";
+
+  for(int i=0;i<2;i++){
+    html += "<div class='sensor'>";
+    html += "<h3>Sensor "+String(i+1)+"</h3>";
+    html += "Temp: "+String(sensors[i].temp)+" °C<br>";
+    html += "Hum: "+String(sensors[i].hum)+" %<br>";
+    html += "Pressure: "+String(sensors[i].press)+" hPa<br>";
+    html += "Time: "+sensors[i].timeStr+"<br></div>";
+  }
+
+  html += "<script>setTimeout(()=>{location.reload();},1000);</script>";
+  html += "</body></html>";
+  server.send(200,"text/html",html);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21,22);
+
+  if(!display.begin(OLED_ADDR,true)){
+    Serial.println("OLED not found!");
+    while(1);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(0,0);
+  display.println("Initializing...");
+  display.display();
+
+  // RTC
+  if(!rtc.begin()) while(1);
+  if(rtc.lostPower()) rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
+
+  // Sensors
+  for(uint8_t i=0;i<2;i++){
+    tcaSelect(i);
+    if(!aht.begin()) Serial.printf("AHT20 %d not found!\n",i);
+    if(!bmp.begin(0x76)) Serial.printf("BMP280 %d not found!\n",i);
+  }
+
+  // Wi-Fi
+  WiFi.begin(ssid,password);
+  Serial.print("Connecting to WiFi");
+  while(WiFi.status()!=WL_CONNECTED){
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected! IP: "+WiFi.localIP().toString());
+
+  server.on("/", handleRoot);
+  server.begin();
+}
+
+void loop() {
+  server.handleClient(); // serve web page
+
+  readSensors(); // read latest sensor data
+
+  // Update OLED display
+  display.clearDisplay();
+  display.setCursor(0,0);
+  for(int i=0;i<2;i++){
+    display.printf("S%d T: %.2fC H: %.2f%%\nP: %.2f hPa\n", 
+                   i+1, sensors[i].temp, sensors[i].hum, sensors[i].press);
+  }
+  display.display();
+
+  delay(1000); // update every second
+}
